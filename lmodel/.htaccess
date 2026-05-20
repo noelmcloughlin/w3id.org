@@ -1,146 +1,392 @@
 Options +FollowSymLinks
+Options -MultiViews
 RewriteEngine on
+
+# ============================================================================
+# MIME type registrations
+# w3id mostly redirects (3xx) to GitHub raw, which sets its own Content-Type,
+# so these are belt-and-braces - useful only if a representation is ever
+# served directly from this host.
+# ============================================================================
+AddType application/rdf+xml      .rdf
+AddType text/turtle              .ttl
+AddType application/n-triples    .nt
+AddType application/ld+json      .jsonld
+AddType text/shex                .shex
+AddType application/yaml         .yaml
+
+# ============================================================================
+# Minor caveats & accepted design trade-offs (deep-review notes)
+# Every item below is minor (rare-in-practice) or trivial (cosmetic)
+# ----------------------------------------------------------------------------
+# 1. [minor]   Conneg is regex-based and cannot parse `;q=` weights. First
+#    matching rule wins by file order. Multi-Accept clients always get the
+#    rule listed first (e.g. `Accept: application/json, text/turtle` ->
+#    turtle). Rare: most clients send a single preferred type.
+# 2. [trivial] Bare `<repo>/<anything>.yaml` always redirects to the
+#    canonical schema YAML regardless of `<anything>` (LinkML schemas are
+#    single-file; intentional).
+# 3. [trivial] HTML conneg returns 303 (See Other); the LMODEL PROJECTS
+#    catch-all returns 302 (Found). Same destination, different semantics
+#    by design.
+# 4. [trivial] `<repo>/jsonld/foo.json` and `<repo>/jsonschema/foo.json`
+#    mis-route to `project/json/...`; honest 404 upstream either way.
+#    Not worth guarding.
+# 5. [trivial] `AddType` set is sparse - w3id.org always 3xx-redirects,
+#    GitHub raw sets `Content-Type`. AddType only matters if served
+#    directly here.
+# 6. [trivial] Deprecated MIME variants (`text/x-yaml`, `application/x-
+#    turtle`) not accepted by conneg; clients sending only those get 406.
+# 7. [minor]   `[N,DPI]` rules assume single-pass aliasing (no alias-of-
+#    alias). If chained aliases are added, order them so each `[N]` rule
+#    precedes rules that match its output. Apache's LimitInternalRecursion
+#    =10 cap applies.
+# 8. [minor]   STEM override `^uco-([a-z0-9]+)(?:/|$)` matches only single-
+#    segment subnames. Multi-hyphen repos (e.g. `nist-ai-rmf`) need an
+#    explicit entry in the multi-hyphen block below.
+# 9. [trivial] Repo segment `[^/]+` allows dots and unusual chars. No
+#    security impact: every match feeds a fixed-template redirect URL
+#    (no filesystem access, no traversal possible).
+# 10. [trivial] `Options +FollowSymLinks` requires the host vhost to permit
+#     it (w3id.org does). Not portable to restrictive shared hosts.
+# ============================================================================
 
 #### LMODEL ORGANIZATION ###
 
-# Redirect base URLs to GitHub organization
-RewriteRule ^/?$ https://github.com/lmodel [R=302,L]
+# Bare base URL -> GitHub organization page (information resource -> 302)
+RewriteRule ^$ https://github.com/lmodel [R=302,L]
 
-# Schemas
-RewriteRule ^(.*)/schema/(.*)\.yaml$ https://raw.githubusercontent.com/lmodel/$1/main/src/$2/schema/$2.yaml [R=302,L]
-RewriteRule ^(.*)/schema/(.*)$ https://raw.githubusercontent.com/lmodel/$1/main/src/$2/schema/$2.yaml [R=302,L]
+# ============================================================================
+# Path canonicalization & aliases (internal rewrite, no client redirect).
+#
+# Apply *before* the conneg / artifact / schema rules so the entire pipeline
+# sees the canonical form. The [N] flag re-runs the rewrite engine on the
+# new URL; no infinite loops because each substitution removes the prefix
+# the rule matches on.
+# ============================================================================
 
-######
-# Core Linkml Artifacts
-######
-RewriteRule ^(.*)/(.*)\.xlsx$ https://raw.githubusercontent.com/lmodel/$1/main/project/excel/$2.xlsx [R=302,L]
-RewriteRule ^(.*)/(.*)\.graphql$ https://raw.githubusercontent.com/lmodel/$1/main/project/graphql/$2.graphql [R=302,L]
-RewriteRule ^(.*)/(.*)\.java$ https://raw.githubusercontent.com/lmodel/$1/main/project/java/$2.java [R=302,L]
+# Legacy slash form -> canonical hyphen form.
+# [DPI] (Discard PathInfo) prevents Apache from re-appending the original
+# trailing path to the substitution result in per-directory context.
+RewriteRule ^uco/([a-z0-9]+)((?:/.*)?)$ uco-$1$2 [N,DPI]
+RewriteRule ^ucs/([a-z0-9]+)((?:/.*)?)$ ucs-$1$2 [N,DPI]
 
-RewriteRule ^(.*)/(.*\.?)context\.jsonld$ https://raw.githubusercontent.com/lmodel/$1/main/project/jsonld/$2context.jsonld [R=302,L]
-RewriteRule ^(.*)/(.*\.?)context\.json$ https://raw.githubusercontent.com/lmodel/$1/main/project/jsonld/$2context.jsonld [R=302,L]
-RewriteRule ^(.*)/(.*\.?)\.jsonld$ https://raw.githubusercontent.com/lmodel/$1/main/project/jsonld/$2.jsonld [R=302,L]
+# nist-ai-600-1 (official NIST designation) -> nist-ai-rmf (publish slug).
+# Full alias: docs, conneg, artifacts, schema all served from nist-ai-rmf.
+RewriteRule ^nist-ai-600-1((?:/.*)?)$ nist-ai-rmf$1 [N,DPI]
 
-RewriteRule ^(.*)/(.*)\.schema\.json$ https://raw.githubusercontent.com/lmodel/$1/main/project/jsonschema/$2.schema.json [R=302,L]
-RewriteRule ^(.*)/([^\.]+)\.json$ https://raw.githubusercontent.com/lmodel/$1/main/project/json/$2.json [R=302,L]
+# ============================================================================
+# Filename-stem normalization & per-repo branch / layout overrides.
+#
+# gen-project converts hyphens in repo names to underscores in artifact
+# stems (e.g., `uco-core` -> `uco_core.context.jsonld`). Apache `.htaccess`
+# cannot translate hyphens to underscores natively (RewriteMap is forbidden
+# in this context), so we set environment variables per request:
+#
+#   STEM      filename stem used in artifact names. Default: $1.
+#   BRANCH    git branch the rules dereference. Default: main.
+#             Typical values:
+#               main       - default for lmodel-owned LinkML projects.
+#               master     - upstream forks that never renamed (e.g. FINOS).
+#               gh-pages   - CI-published artifact branch when project/ is
+#                            gitignored on the source branch (see template
+#                            below). Use this only if the deploy workflow
+#                            commits gen-project output verbatim - the
+#                            standard LinkML mkdocs deploy DOES NOT.
+#               artifacts  - convention for a dedicated build branch.
+#   PROJECT   path prefix under the branch where gen-project artifacts live,
+#             with trailing slash. Default: "project/". Set to empty ("")
+#             for repos whose artifacts live at the branch root (common
+#             when using a dedicated artifacts branch).
+#
+# Rules below use %{ENV:STEM}, %{ENV:BRANCH}, %{ENV:PROJECT} where these
+# values are needed; the GitHub repo segment in the redirect path
+# continues to use $1 (the URL form).
+#
+# The default rule sets all three; subsequent specific rules override per
+# repo. The `-` substitution leaves the URL unchanged and processing
+# continues. Multiple [E=...] flags on a single rule set multiple vars at
+# once.
+#
+# Reproducibility note: gen-project output is fully reproducible from
+# `src/<stem>/schema/<stem>.yaml`. Repos may legitimately gitignore
+# `project/` - in that case CI must publish the generated tree to a
+# branch this rewriter can reach (raw.githubusercontent.com), and that
+# repo gets a BRANCH override here. `.htaccess` only routes; it cannot
+# regenerate missing artifacts.
+#
+# When adding a new lmodel repo whose name contains hyphens, add an entry
+# below (single-hyphen subnames of uco-/ucs- are matched automatically).
+# ============================================================================
 
-RewriteRule ^(.*)/(.*)\.owl$ https://raw.githubusercontent.com/lmodel/$1/main/project/owl/$2.owl.ttl [R=302,L]
-RewriteRule ^(.*)/prefixmap/(.*)\.yaml$ https://raw.githubusercontent.com/lmodel/$1/main/project/prefixmap/$2.yaml [R=302,L]
-RewriteRule ^(.*)/(.*)\.proto$ https://raw.githubusercontent.com/lmodel/$1/main/project/protobuf/$2.proto [R=302,L]
-RewriteRule ^(.*)/(.*)\.shacl\.ttl$ https://raw.githubusercontent.com/lmodel/$1/main/project/shacl/$2.shacl.ttl [R=302,L]
+# Defaults: STEM=URL repo segment, BRANCH=main, PROJECT=project/
+RewriteRule ^([^/]+) - [E=STEM:$1,E=BRANCH:main,E=PROJECT:project/]
 
-RewriteRule ^(.*)/(.*)\.shex$ https://raw.githubusercontent.com/lmodel/$1/main/project/shex/$2.shex [R=302,L]
-RewriteRule ^(.*)/(.*)\.shexc$ https://raw.githubusercontent.com/lmodel/$1/main/project/shex/$2.shex [R=302,L]
-RewriteRule ^(.*)/(.*)\.shexj$ https://raw.githubusercontent.com/lmodel/$1/main/project/shex/$2.shexj [R=302,L]
+# UCO / UCS families: single hyphen after prefix, no internal hyphens.
+RewriteRule ^uco-([a-z0-9]+)(?:/|$) - [E=STEM:uco_$1]
+RewriteRule ^ucs-([a-z0-9]+)(?:/|$) - [E=STEM:ucs_$1]
 
+# Multi-hyphen repos: enumerated (no regex shortcut available).
+# Only repos that actually publish gen-project artifacts under the
+# convention `src/<stem>/schema/<stem>.yaml` are listed. STEM is the
+# hyphen->underscore form; BRANCH defaults to main and PROJECT to project/
+# unless overridden on the same line.
+# Excluded (fall through to docs catch-all only):
+#   - sssom-files            : data repo, no LinkML schema
+#   - linkml-project-copier  : Copier template, no LinkML schema
+RewriteRule ^nist-sp-800-53(?:/|$)        - [E=STEM:nist_sp_800_53]
+RewriteRule ^nist-sp-800-218(?:/|$)       - [E=STEM:nist_sp_800_218]
+RewriteRule ^nist-sp-800-171(?:/|$)       - [E=STEM:nist_sp_800_171]
+RewriteRule ^nist-csf-v2(?:/|$)           - [E=STEM:nist_csf_v2]
+RewriteRule ^nist-ai-rmf(?:/|$)           - [E=STEM:nist_ai_rmf]
+RewriteRule ^nist-nvd(?:/|$)              - [E=STEM:nist_nvd]
+RewriteRule ^vulnerability-core(?:/|$)    - [E=STEM:vulnerability_core]
+RewriteRule ^kev-catalog(?:/|$)           - [E=STEM:kev_catalog]
+RewriteRule ^cis-controls(?:/|$)          - [E=STEM:cis_controls]
+RewriteRule ^fluxnova-bpm-platform(?:/|$) - [E=STEM:fluxnova_bpm_platform]
+
+# common-domain-model: FINOS upstream uses the `master` branch (no `main`).
+# Schema YAML lives at the standard `src/<stem>/schema/<stem>.yaml` path on
+# master; gen-project artifacts under `project/` must also be present on
+# master for non-YAML conneg / extension routes to resolve.
+RewriteRule ^common-domain-model(?:/|$)   - [E=STEM:common_domain_model,E=BRANCH:master]
+
+# ----------------------------------------------------------------------------
+# Template: repo with `project/` gitignored, artifacts CI-published elsewhere
+# ----------------------------------------------------------------------------
+# Use one of these patterns when a repo intentionally does NOT commit its
+# gen-project output to the source branch. The redirect target must be a
+# branch that raw.githubusercontent.com can serve. Example variants:
+#
+#   # Variant A: artifacts pushed to a dedicated `artifacts` branch with
+#   # the standard `project/<dir>/<stem>.<ext>` layout preserved.
+#   #RewriteRule ^example-repo(?:/|$) - [E=STEM:example_repo,E=BRANCH:artifacts]
+#
+#   # Variant B: artifacts pushed to a branch with files at the branch root
+#   # (no `project/` wrapper). Override PROJECT to empty.
+#   #RewriteRule ^example-repo(?:/|$) - [E=STEM:example_repo,E=BRANCH:artifacts,E=PROJECT:]
+#
+#   # Variant C: artifacts living on `gh-pages` under `project/` (only
+#   # works if the deploy workflow explicitly preserves the directory -
+#   # mkdocs/material themes overwrite gh-pages root, so this requires a
+#   # custom `mkdocs gh-deploy --remote-branch gh-pages --dirty` setup or
+#   # a separate orphan branch).
+#   #RewriteRule ^example-repo(?:/|$) - [E=STEM:example_repo,E=BRANCH:gh-pages]
+#
+# See TEST_REPORT.md for a worked smoke-test pattern. Activate by removing
+# the leading `#` and testing the routes against the live repo.
+# ----------------------------------------------------------------------------
+
+# ============================================================================
+# Schemas - convenience routes to canonical YAML source.
+# YAML schema is a Core LinkML representation of the model -> 303 See Other.
+# Filename stem (%{ENV:STEM}) handles the hyphen->underscore convention
+# of gen-project (see Filename-stem normalization block above).
+#
+# Three accepted forms:
+#   <repo>/schema/<anything>.yaml   - explicit YAML extension
+#   <repo>/schema[/<bare-name>]     - bare path under /schema/ (no extension)
+#   <repo>/<anything>.yaml          - bare-extension fallback (excludes
+#                                     prefixmap/golr/yaml/.linkml.yaml/schema
+#                                     paths handled by other rules)
+# All three resolve to src/<stem>/schema/<stem>.yaml. The third form
+# always lands on the canonical schema regardless of the requested name -
+# this is intentional (LinkML schemas are single-file).
+# ============================================================================
+RewriteRule ^([^/]+)/schema/(.+)\.yaml$  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/src/%{ENV:STEM}/schema/%{ENV:STEM}.yaml [R=303,NE,L]
+RewriteRule ^([^/]+)/schema(?:/[^.]*)?$  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/src/%{ENV:STEM}/schema/%{ENV:STEM}.yaml [R=303,NE,L]
+
+# Bare <repo>/<anything>.yaml fallback. Guards exclude paths claimed by
+# more specific rules below (prefixmap, golr, yaml directory, .linkml.yaml).
+RewriteCond %{REQUEST_URI} !/(schema|prefixmap|golr|yaml)/
+RewriteCond %{REQUEST_URI} !\.linkml\.yaml$
+RewriteRule ^([^/]+)/(.+)\.yaml$         https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/src/%{ENV:STEM}/schema/%{ENV:STEM}.yaml [R=303,NE,L]
+
+# ============================================================================
+# Core LinkML Artifacts - representations of the model (non-information
+# resource) -> 303 See Other. All use [^/]+ for the repo segment to avoid
+# greedy capture across nested paths.
+# ============================================================================
+
+# GraphQL
+RewriteRule ^([^/]+)/(.+)\.graphql$         https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}graphql/$2.graphql [R=303,NE,L]
+
+# JSON-LD (context + plain). The `.context.json` variant exists because some
+# clients/CDNs reject `.jsonld` extension; the rewrite is identical.
+# Bare `context.jsonld` (no prefix) is the common `@context` idiom - it must
+# inject the repo's normalized stem (gen-project emits `<stem>.context.jsonld`).
+RewriteRule ^([^/]+)/context\.jsonld$      https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/%{ENV:STEM}.context.jsonld [R=303,NE,L]
+RewriteRule ^([^/]+)/context\.json$        https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/%{ENV:STEM}.context.jsonld [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.context\.jsonld$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/$2.context.jsonld [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.context\.json$   https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/$2.context.jsonld [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.jsonld$         https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/$2.jsonld [R=303,NE,L]
+
+# JSON Schema + plain JSON. `.schema.json` is matched first; remaining `.json`
+# requests fall through here. Excludes `/terminusdb/` (has its own Non-Core
+# rule below that emits a different target directory).
+RewriteRule ^([^/]+)/(.+)\.schema\.json$  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonschema/$2.schema.json [R=303,NE,L]
+RewriteCond %{REQUEST_URI} !/terminusdb/
+RewriteRule ^([^/]+)/(.+)\.json$          https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}json/$2.json [R=303,NE,L]
+
+# OWL (gen-project emits as .owl.ttl), RDF/XML & N-Triples (from gen-rdf).
+# Both `.owl` and `.owl.ttl` resolve to the same generated file, so a
+# round-trip from the redirect target back to its filename works.
+RewriteRule ^([^/]+)/(.+)\.owl(?:\.ttl)?$   https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}owl/$2.owl.ttl [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.rdf$             https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/$2.rdf [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.nt$              https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/$2.nt [R=303,NE,L]
+
+# Prefix map (semantic config)
+RewriteRule ^([^/]+)/prefixmap/(.+)\.yaml$  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}prefixmap/$2.yaml [R=303,NE,L]
+
+# Protobuf, SHACL, ShEx, SQL DDL.
+# ShEx note: gen-shex emits .shex (compact) and .shexj (JSON). The
+# .shexc extension is an alias for the compact form and resolves to the
+# same .shex file.
+RewriteRule ^([^/]+)/(.+)\.proto$           https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}protobuf/$2.proto [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.shacl\.ttl$      https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shacl/$2.shacl.ttl [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.shex$            https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shex/$2.shex [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.shexc$           https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shex/$2.shex [R=303,NE,L]
+RewriteRule ^([^/]+)/(.+)\.shexj$           https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shex/$2.shexj [R=303,NE,L]
+RewriteCond %{REQUEST_URI} !/sqlvalidation/
+RewriteRule ^([^/]+)/(.+)\.sql$             https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}sqlschema/$2.sql [R=303,NE,L]
+
+# Turtle (excludes .owl.ttl which is matched by the .owl rule above)
 RewriteCond %{REQUEST_URI} !\.owl\.
-RewriteRule ^(.*)/(.*)\.ttl$ https://raw.githubusercontent.com/lmodel/$1/main/project/rdf/$2.ttl [R=302,L]
-RewriteRule ^(.*)/(.*)\.sql$ https://raw.githubusercontent.com/lmodel/$1/main/project/sqlschema/$2.sql [R=302,L]
+RewriteRule ^([^/]+)/(.+)\.ttl$             https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/$2.ttl [R=303,NE,L]
 
-#####
-# Non-Core Artifacts
-#####
+# Merged LinkML YAML
+RewriteRule ^([^/]+)/(.+)\.linkml\.yaml$    https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}linkml/$2.linkml.yaml [R=303,NE,L]
 
-RewriteRule ^(.*)/(.*)\.ts$ https://raw.githubusercontent.com/lmodel/$1/main/project/typescript/$2.ts [R=302,L]
-RewriteRule ^(.*)/(.*)\.h$ https://raw.githubusercontent.com/lmodel/$1/main/project/cpp/$2.h [R=302,L]
-RewriteRule ^(.*)/(.*)\.csv$ https://raw.githubusercontent.com/lmodel/$1/main/project/csv/$2.csv [R=302,L]
-RewriteRule ^(.*)/(.*)\.dbml$ https://raw.githubusercontent.com/lmodel/$1/main/project/dbml/$2.dbml [R=302,L]
-RewriteRule ^(.*)/(.*)\.er\.md$ https://raw.githubusercontent.com/lmodel/$1/main/project/erdiagram/$2.er.md [R=302,L]
-RewriteRule ^(.*)/(.*)\.go$ https://raw.githubusercontent.com/lmodel/$1/main/project/golang/$2.go [R=302,L]
-RewriteRule ^(.*)/golr/(.*)\.yaml$ https://raw.githubusercontent.com/lmodel/$1/main/project/golr/$2.yaml [R=302,L]
-RewriteRule ^(.*)/(.*)\.dot\.dot$ https://raw.githubusercontent.com/lmodel/$1/main/project/graphviz/$2.dot.dot [R=302,L]
+# ============================================================================
+# Non-Core Artifacts - concrete information resources / code-gen outputs.
+# Use 302 (cacheable). Not in scope for content negotiation: MIME types
+# collide across path-segregated outputs (3× .py: pandera/sqla/namespaces;
+# 3× .yaml: schema/golr/prefixmap; 2× .md: mermaid/markdown-datadict;
+# 2× .sql: sqlschema/sqlvalidation) - only the URL path disambiguates.
+# ============================================================================
+RewriteRule ^([^/]+)/(.+)\.xlsx$                  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}excel/$2.xlsx [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.java$                  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}java/$2.java [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.ts$                    https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}typescript/$2.ts [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.h$                     https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}cpp/$2.h [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.csv$                   https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}csv/$2.csv [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.dbml$                  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}dbml/$2.dbml [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.er\.md$                https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}erdiagram/$2.er.md [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.go$                    https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}golang/$2.go [R=302,NE,L]
+RewriteRule ^([^/]+)/golr/(.+)\.yaml$             https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}golr/$2.yaml [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.dot\.dot$              https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}graphviz/$2.dot.dot [R=302,NE,L]
+RewriteRule ^([^/]+)/markdown-datadict/(.+)\.md$  https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}markdown-datadict/$2.md [R=302,NE,L]
+RewriteRule ^([^/]+)/mermaid/(.+)\.md$            https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}mermaid/$2.md [R=302,NE,L]
+RewriteRule ^([^/]+)/namespaces/(.+)\.py$         https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}namespaces/$2.py [R=302,NE,L]
+RewriteRule ^([^/]+)/pandera/(.+)\.py$            https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}pandera/$2.py [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.plantuml$              https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}plantuml/$2.plantuml [R=302,NE,L]
+RewriteRule ^([^/]+)/sqla/(.+)\.py$               https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}sqla/$2.py [R=302,NE,L]
+RewriteRule ^([^/]+)/sqlvalidation/(.+)\.sql$     https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}sqlvalidation/$2.sql [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.sssom\.tsv$            https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}sssom/$2.sssom.tsv [R=302,NE,L]
+RewriteRule ^([^/]+)/summary/(.+)\.tsv$           https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}summary/$2.tsv [R=302,NE,L]
+RewriteRule ^([^/]+)/terminusdb/(.+)\.json$       https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}terminusdb/$2.json [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.tql$                   https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}typedb/$2.tql [R=302,NE,L]
+RewriteRule ^([^/]+)/yaml/(.+)\.yaml$             https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}yaml/$2.yaml [R=302,NE,L]
+RewriteRule ^([^/]+)/rust/Cargo\.toml$            https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rust/Cargo.toml [R=302,NE,L]
+RewriteRule ^([^/]+)/(.+)\.rq$                    https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}sparql/$2.rq [R=302,NE,L]
 
-RewriteRule ^(.*)/markdown-datadict/(.*)\.md$ https://raw.githubusercontent.com/lmodel/$1/main/project/markdown-datadict/$2.md [R=302,L]
-RewriteRule ^(.*)/mermaid/(.*)\.md$ https://raw.githubusercontent.com/lmodel/$1/main/project/mermaid/$2.md [R=302,L]
-RewriteRule ^(.*)/namespaces/(.*)\.py$ https://raw.githubusercontent.com/lmodel/$1/main/project/namespaces/$2.py [R=302,L]
-RewriteRule ^(.*)/pandera/(.*)\.py$ https://raw.githubusercontent.com/lmodel/$1/main/project/pandera/$2.py [R=302,L]
-RewriteRule ^(.*)/(.*)\.plantuml$ https://raw.githubusercontent.com/lmodel/$1/main/project/plantuml/$2.plantuml [R=302,L]
-RewriteRule ^(.*)/sqla/(.*)\.py$ https://raw.githubusercontent.com/lmodel/$1/main/project/sqla/$2.py [R=302,L]
-RewriteRule ^(.*)/sqlvalidation/(.*)\.sql$ https://raw.githubusercontent.com/lmodel/$1/main/project/sqlvalidation/$2.sql [R=302,L]
-RewriteRule ^(.*)/(.*)\.sssom\.tsv$ https://raw.githubusercontent.com/lmodel/$1/main/project/sssom/$2.sssom.tsv [R=302,L]
-RewriteRule ^(.*)/summary/(.*)\.tsv$ https://raw.githubusercontent.com/lmodel/$1/main/project/summary/$2.tsv [R=302,L]
-RewriteRule ^(.*)/terminusdb/(.*)\.json$ https://raw.githubusercontent.com/lmodel/$1/main/project/terminusdb/$2.json [R=302,L]
-RewriteRule ^(.*)/(.*)\.tql$ https://raw.githubusercontent.com/lmodel/$1/main/project/terminusdb/$2.tql [R=302,L]
-RewriteRule ^(.*)/yaml/(.*)\.yaml$ https://raw.githubusercontent.com/lmodel/$1/main/project/yaml/$2.yaml [R=302,L]
+# ============================================================================
+# Content negotiation - Core LinkML / Linked Data representations ONLY.
+# Fires only when the request URI has no file extension (the client is
+# asking for the model as an abstract resource and letting the server
+# choose the representation). Each rule emits a single 303 See Other to
+# the canonical raw artifact (or to the docs site for HTML).
+#
+# Scope: repo root AND any depth - so class/slot IRIs like
+# /lmodel/<repo>/<TermName> also content-negotiate. The artifact filename
+# stem comes from %{ENV:STEM} (see Filename-stem normalization block).
+#
+# Non-Core artifacts are intentionally excluded - see note above.
+# ============================================================================
 
-# Discuss how to handle these (plus java)
-RewriteRule ^(.*)/rust/Cargo\.toml$ https://raw.githubusercontent.com/lmodel/$1/main/project/rust/Cargo.toml [R=302,L]
-RewriteRule ^(.*)/(.*)\.rq$ https://raw.githubusercontent.com/lmodel/$1/main/project/sparql/$2.rq [R=302,L]
-# linkml schema merged
-RewriteRule ^(.*)/(.*)\.linkml\.yaml$ https://raw.githubusercontent.com/lmodel/$1/main/project/linkml/$2.linkml.yaml [R=302,L]
+# Turtle
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} text/turtle [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/%{ENV:STEM}.ttl [R=303,NE,L]
 
+# RDF/XML and OWL/XML (requires `gen-rdf` to have produced .rdf)
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/rdf\+xml [NC,OR]
+RewriteCond %{HTTP_ACCEPT} application/owl\+xml [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/%{ENV:STEM}.rdf [R=303,NE,L]
+
+# N-Triples
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/n-triples [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}rdf/%{ENV:STEM}.nt [R=303,NE,L]
+
+# JSON-LD
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/ld\+json [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/%{ENV:STEM}.context.jsonld [R=303,NE,L]
+
+# Plain JSON - fallback to JSON-LD context. Clients sending
+# Accept: application/json (curl --json, generic HTTP libraries) get
+# the JSON-LD @context document, the broadest sensible JSON form of
+# the model. Must come AFTER application/ld+json so that clients
+# accepting both pick the more specific representation.
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/json [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonld/%{ENV:STEM}.context.jsonld [R=303,NE,L]
+
+# JSON Schema
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/schema\+json [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}jsonschema/%{ENV:STEM}.schema.json [R=303,NE,L]
+
+# SHACL (Turtle profile)
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/shacl\+turtle [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shacl/%{ENV:STEM}.shacl.ttl [R=303,NE,L]
+
+# ShEx
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} text/shex [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/%{ENV:PROJECT}shex/%{ENV:STEM}.shex [R=303,NE,L]
+
+# LinkML schema source (YAML)
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} application/yaml [NC,OR]
+RewriteCond %{HTTP_ACCEPT} text/yaml [NC,OR]
+RewriteCond %{HTTP_ACCEPT} application/x-yaml [NC]
+RewriteRule ^([^/]+)(?:/.*)?$ https://raw.githubusercontent.com/lmodel/$1/%{ENV:BRANCH}/src/%{ENV:STEM}/schema/%{ENV:STEM}.yaml [R=303,NE,L]
+
+# HTML - browser default. Explicit `Accept: */*` (curl, libraries, crawlers
+# without preference) is intentionally NOT matched here - it falls through
+# to the LMODEL PROJECTS catch-all below, which redirects to the same docs
+# site (R=302) and lets per-repo alias rules apply.
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} text/html [NC,OR]
+RewriteCond %{HTTP_ACCEPT} application/xhtml\+xml [NC]
+RewriteRule ^([^/]+)(/.*)?$ https://lmodel.github.io/$1$2 [R=303,NE,L]
+
+# 406 Not Acceptable - Accept header present, specific, and no representation
+# matched. `Accept: */*` is explicitly excluded so generic clients fall
+# through to the LMODEL PROJECTS catch-all instead of being rejected.
+# Bare 406 (no body) per w3id convention for sites without a per-repo 406.html.
+RewriteCond %{REQUEST_URI} !\.[^./]+$
+RewriteCond %{HTTP_ACCEPT} .+
+RewriteCond %{HTTP_ACCEPT} !\*/\*
+RewriteRule ^(.+)$ - [R=406,L]
 
 #### LMODEL PROJECTS ###
-
-# RewriteRule ^NAME(?:/|$)(.*)$ https://lmodel.github.io/NAME/$1 [R=302,L]
-
-# NIST
-RewriteRule ^nist-catalog(?:/|$)(.*)$ https://lmodel.github.io/nist-catalog/$1 [R=302,L]
-RewriteRule ^nist-csf-v2(?:/|$)(.*)$ https://lmodel.github.io/nist-csf-v2/$1 [R=302,L]
-RewriteRule ^nist-sp-800-53(?:/|$)(.*)$ https://lmodel.github.io/nist-sp-800-53/$1 [R=302,L]
-RewriteRule ^nist-sp-800-218(?:/|$)(.*)$ https://lmodel.github.io/nist-sp-800-218/$1 [R=302,L]
-RewriteRule ^nist-sp-800-171(?:/|$)(.*)$ https://lmodel.github.io/nist-sp-800-171/$1 [R=302,L]
-RewriteRule ^nist-ai-rmf(?:/|$)(.*)$ https://lmodel.github.io/nist-ai-rmf/$1 [R=302,L]
-# alias
-RewriteRule ^nist-ai-600-1(?:/|$)(.*)$ https://lmodel.github.io/nist-ai-rmf/$1 [R=302,L]
-RewriteRule ^nist-nvd(?:/|$)(.*)$ https://lmodel.github.io/nist-nvd/$1 [R=302,L]
-
-# FINANCIAL
-RewriteRule ^common-domain-model(?:/|$)(.*)$ https://lmodel.github.io/common-domain-model/$1 [R=302,L]
-RewriteRule ^fluxnova-bpm-platform(?:/|$)(.*)$ https://lmodel.github.io/fluxnova-bpm-platform/$1 [R=302,L]
-RewriteRule ^fix-sbe(?:/|$)(.*)$ https://lmodel.github.io/fix-sbe/$1 [R=302,L]
-RewriteRule ^ffiec-sec(?:/|$)(.*)$ https://lmodel.github.io/ffiec-sec/$1 [R=302,L]
-RewriteRule ^ffiec-aud(?:/|$)(.*)$ https://lmodel.github.io/ffiec-aud/$1 [R=302,L]
-
-# FOUNDATIONAL
-RewriteRule ^collections(?:/|$)(.*)$ https://lmodel.github.io/collections/$1 [R=302,L]
-RewriteRule ^void(?:/|$)(.*)$ https://lmodel.github.io/void/$1 [R=302,L]
-RewriteRule ^datatype(?:/|$)(.*)$ https://lmodel.github.io/datatype/$1 [R=302,L]
-RewriteRule ^gist(?:/|$)(.*)$ https://lmodel.github.io/gist/$1 [R=302,L]
-
-# PLACENAMES
-RewriteRule ^geosparql(?:/|$)(.*)$ https://lmodel.github.io/geosparql/$1 [R=302,L]
-RewriteRule ^placenames(?:/|$)(.*)$ https://lmodel.github.io/placenames/$1 [R=302,L]
-
-# AI
-RewriteRule ^mcp(?:/|$)(.*)$ https://lmodel.github.io/mcp/$1 [R=302,L]
-
-# ISO
-RewriteRule ^iso27001(?:/|$)(.*)$ https://lmodel.github.io/iso27001/$1 [R=302,L]
-RewriteRule ^iso29100(?:/|$)(.*)$ https://lmodel.github.io/iso29100/$1 [R=302,L]
-RewriteRule ^iso42001(?:/|$)(.*)$ https://lmodel.github.io/iso42001/$1 [R=302,L]
-
-# CYBER
-RewriteRule ^ocsf(?:/|$)(.*)$ https://lmodel.github.io/ocsf/$1 [R=302,L]
-RewriteRule ^spdx(?:/|$)(.*)$ https://lmodel.github.io/spdx/$1 [R=302,L]
-RewriteRule ^attack(?:/|$)(.*)$ https://lmodel.github.io/attack/$1 [R=302,L]
-RewriteRule ^d3fend(?:/|$)(.*)$ https://lmodel.github.io/d3fend/$1 [R=302,L]
-RewriteRule ^oscal(?:/|$)(.*)$ https://lmodel.github.io/oscal/$1 [R=302,L]
-RewriteRule ^capec(?:/|$)(.*)$ https://lmodel.github.io/capec/$1 [R=302,L]
-RewriteRule ^cis-controls(?:/|$)(.*)$ https://lmodel.github.io/cis-controls/$1 [R=302,L]
-RewriteRule ^vunerability-core(?:/|$)(.*)$ https://lmodel.github.io/vunerability-core/$1 [R=302,L]
-RewriteRule ^kev-catalog(?:/|$)(.*)$ https://lmodel.github.io/kev-catalog/$1 [R=302,L]
-RewriteRule ^cve(?:/|$)(.*)$ https://lmodel.github.io/cve/$1 [R=302,L]
-RewriteRule ^cwe(?:/|$)(.*)$ https://lmodel.github.io/cwe/$1 [R=302,L]
-RewriteRule ^stix(?:/|$)(.*)$ https://lmodel.github.io/stix/$1 [R=302,L]
-RewriteRule ^slsa(?:/|$)(.*)$ https://lmodel.github.io/slsa/$1 [R=302,L]
-# unified cyber ontology
-RewriteRule ^uco[-/]master(?:/|$)(.*)$ https://lmodel.github.io/uco-master/$1 [R=302,L]
-RewriteRule ^uco[-/]marking(?:/|$)(.*)$ https://lmodel.github.io/uco-marking/$1 [R=302,L]
-RewriteRule ^uco[-/]time(?:/|$)(.*)$ https://lmodel.github.io/uco-time/$1 [R=302,L]
-RewriteRule ^uco[-/]vocabulary(?:/|$)(.*)$ https://lmodel.github.io/uco-vocabulary/$1 [R=302,L]
-RewriteRule ^uco[-/]configuration(?:/|$)(.*)$ https://lmodel.github.io/uco-configuration/$1 [R=302,L]
-RewriteRule ^uco[-/]location(?:/|$)(.*)$ https://lmodel.github.io/uco-location/$1 [R=302,L]
-RewriteRule ^uco[-/]pattern(?:/|$)(.*)$ https://lmodel.github.io/uco-pattern/$1 [R=302,L]
-RewriteRule ^uco[-/]victim(?:/|$)(.*)$ https://lmodel.github.io/uco-victim/$1 [R=302,L]
-RewriteRule ^uco[-/]core(?:/|$)(.*)$ https://lmodel.github.io/uco-core/$1 [R=302,L]
-RewriteRule ^uco[-/]action(?:/|$)(.*)$ https://lmodel.github.io/uco-action/$1 [R=302,L]
-RewriteRule ^uco[-/]tool(?:/|$)(.*)$ https://lmodel.github.io/uco-tool/$1 [R=302,L]
-RewriteRule ^uco[-/]role(?:/|$)(.*)$ https://lmodel.github.io/uco-role/$1 [R=302,L]
-RewriteRule ^uco[-/]identity(?:/|$)(.*)$ https://lmodel.github.io/uco-identity/$1 [R=302,L]
-RewriteRule ^uco[-/]types(?:/|$)(.*)$ https://lmodel.github.io/uco-types/$1 [R=302,L]
-RewriteRule ^uco[-/]observable(?:/|$)(.*)$ https://lmodel.github.io/uco-observable/$1 [R=302,L]
-
-# UCS (review)
-RewriteRule ^ucs[-/]core(?:/|$)(.*)$ https://lmodel.github.io/ucs-core/$1 [R=302,L]
-RewriteRule ^ucs[-/]containers(?:/|$)(.*)$ https://lmodel.github.io/ucs-containers/$1 [R=302,L]
+#
+# All lmodel repos route generically - the catch-all below redirects any
+# `<repo>/<rest>` path to `lmodel.github.io/<repo>/<rest>`.
+#
+# Aliases (slug A serves docs of slug B) and path canonicalization
+# (e.g. `uco/core` -> `uco-core`) are applied as internal rewrites with
+# `[N]` near the top of this file, so by the time we reach this section
+# every request has its canonical `<repo>/<rest>` form.
+#
+# Earlier revisions of this file kept docs-site canonicalization rules
+# for `uco-`, `ucs-`, and `nist-ai-600-1` here. Those rules were
+# unreachable in normal operation (the `[N]` block already canonicalizes
+# the path) and unhelpful as a fallback (artifact rules upstream of this
+# section had already mis-routed by the time the canonicalization rules
+# could fire). They have been removed; the catch-all below is sufficient.
+RewriteRule ^([^/]+)(/.*)?$ https://lmodel.github.io/$1$2 [R=302,NE,L]
