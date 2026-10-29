@@ -90,6 +90,10 @@ RewriteRule ^kev-catalog(?:/|$)           - [E=STEM:kev_catalog]
 RewriteRule ^cis-controls(?:/|$)          - [E=STEM:cis_controls]
 RewriteRule ^fluxnova-bpm-platform(?:/|$) - [E=STEM:fluxnova_bpm_platform]
 
+# spdx: the Python package, and so the schema's file names, are spdx_linkml,
+# because the name spdx is taken on PyPI.
+RewriteRule ^spdx(?:/|$)                  - [E=STEM:spdx_linkml]
+
 # common-domain-model: FINOS upstream uses `master` branch (not `main`).
 RewriteRule ^common-domain-model(?:/|$)   - [E=STEM:common_domain_model,E=BRANCH:master]
 
