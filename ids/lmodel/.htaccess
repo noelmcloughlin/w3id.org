@@ -89,6 +89,7 @@ RewriteRule ^vulnerability-core(?:/|$)    - [E=STEM:vulnerability_core]
 RewriteRule ^kev-catalog(?:/|$)           - [E=STEM:kev_catalog]
 RewriteRule ^cis-controls(?:/|$)          - [E=STEM:cis_controls]
 RewriteRule ^fluxnova-bpm-platform(?:/|$) - [E=STEM:fluxnova_bpm_platform]
+RewriteRule ^github-actions(?:/|$)        - [E=STEM:github_actions]
 
 # spdx: the Python package, and so the schema's file names, are spdx_linkml,
 # because the name spdx is taken on PyPI.
